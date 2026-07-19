@@ -1,49 +1,164 @@
 import { kv } from "@vercel/kv";
 
-const KEY = "fintrack:data";
+const KEY         = "fintrack:data";
+const REV_KEY     = "fintrack:rev";
+const BACKUP_LIST = "fintrack:backups";
+const MAX_BACKUPS = 20;
 
-const DEMO_DATA = {
-  accounts: [
-    { id: 1, name: "HDFC Savings", type: "Bank", balance: 125000 },
-    { id: 2, name: "Cash on Hand", type: "Cash", balance: 5000 },
-    { id: 3, name: "PhonePe", type: "Digital Wallet", balance: 2500 },
-    { id: 4, name: "LIC Fixed Deposit", type: "Fixed Deposit", balance: 50000 },
-  ],
-  investments: [
-    { id: 1, name: "Reliance Industries", type: "Stocks", invested: 50000, current: 62000, notes: "NSE" },
-    { id: 2, name: "Bitcoin", type: "Crypto", invested: 30000, current: 45000, notes: "" },
-    { id: 3, name: "Axis Bluechip Fund", type: "Mutual Fund", invested: 100000, current: 118000, notes: "SIP 5k/mo" },
-    { id: 4, name: "Digital Gold", type: "Gold", invested: 20000, current: 22500, notes: "" },
-  ],
-  goals: [
-    { id: 1, name: "🚗 Buy a Car", target: 800000, saved: 250000, date: "2027-06" },
-    { id: 2, name: "🏖️ Goa Trip", target: 80000, saved: 55000, date: "2026-12" },
-    { id: 3, name: "🛡️ Emergency Fund", target: 300000, saved: 180000, date: "2026-10" },
-  ],
-  liabilities: [
-    { id: 1, name: "Home Loan", type: "Home Loan", total: 2500000, remaining: 1800000, rate: 8.5, emi: 22000 },
-  ],
-  snapshots: [
-    { label: "Jan", nw: 350000 }, { label: "Feb", nw: 368000 }, { label: "Mar", nw: 385000 },
-    { label: "Apr", nw: 405000 }, { label: "May", nw: 430000 }, { label: "Jun", nw: 452000 },
-  ],
-};
+/**
+ * IMPORTANT DESIGN NOTE
+ *
+ * A previous version of this route caught KV errors and returned demo data
+ * with a 200 status. The client could not tell "the store is down" from
+ * "here is your real data", so it kept its demo defaults in state and then
+ * POSTed them straight back — permanently overwriting the user's real data.
+ *
+ * Rules now:
+ *   1. Never invent data. A read failure is a 503, never a 200.
+ *   2. An empty store returns data:null. It does NOT return demo values.
+ *   3. Writes are revision-checked, so a client that failed to load can
+ *      never blind-overwrite a good record.
+ *   4. Every write snapshots the previous value into a capped backup list.
+ */
 
-export async function GET() {
+const SHAPE = ["accounts", "investments", "goals", "liabilities", "snapshots"];
+
+function validate(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return "Payload must be an object";
+  }
+  for (const k of SHAPE) {
+    if (!(k in data)) return `Missing "${k}"`;
+    if (!Array.isArray(data[k])) return `"${k}" must be an array`;
+  }
+  return null;
+}
+
+const fail = (status, error, extra = {}) =>
+  Response.json({ ok: false, error, ...extra }, { status });
+
+export async function GET(request) {
+  const wantsBackups =
+    new URL(request.url).searchParams.get("backups") !== null;
+
   try {
-    const data = await kv.get(KEY);
-    return Response.json(data || DEMO_DATA);
+    if (wantsBackups) {
+      const raw = await kv.lrange(BACKUP_LIST, 0, MAX_BACKUPS - 1);
+      const backups = (raw || []).map((entry, i) => {
+        const parsed = typeof entry === "string" ? JSON.parse(entry) : entry;
+        return {
+          index: i,
+          at: parsed.at,
+          rev: parsed.rev,
+          counts: Object.fromEntries(
+            SHAPE.map((k) => [k, (parsed.data?.[k] || []).length])
+          ),
+        };
+      });
+      return Response.json({ ok: true, backups });
+    }
+
+    const [data, rev] = await Promise.all([kv.get(KEY), kv.get(REV_KEY)]);
+
+    return Response.json({
+      ok: true,
+      data: data ?? null,        // null means "nothing stored yet"
+      rev: typeof rev === "number" ? rev : 0,
+    });
   } catch (e) {
-    return Response.json(DEMO_DATA);
+    // Loud, honest failure. The client must not fall back to defaults.
+    return fail(503, `Storage unavailable: ${e?.message || e}`);
   }
 }
 
 export async function POST(request) {
+  let body;
   try {
-    const body = await request.json();
-    await kv.set(KEY, body);
-    return Response.json({ ok: true });
+    body = await request.json();
+  } catch {
+    return fail(400, "Invalid JSON body");
+  }
+
+  const { data, baseRev } = body || {};
+
+  const invalid = validate(data);
+  if (invalid) return fail(400, invalid);
+
+  if (typeof baseRev !== "number") {
+    // Refuse writes from any client that did not complete a successful read.
+    return fail(400, "baseRev is required — refusing a blind write");
+  }
+
+  try {
+    const currentRev = (await kv.get(REV_KEY)) ?? 0;
+
+    if (baseRev !== currentRev) {
+      return fail(
+        409,
+        "Your copy is out of date — reload before saving",
+        { code: "stale", rev: currentRev }
+      );
+    }
+
+    const previous = await kv.get(KEY);
+    if (previous) {
+      await kv.lpush(
+        BACKUP_LIST,
+        JSON.stringify({ at: new Date().toISOString(), rev: currentRev, data: previous })
+      );
+      await kv.ltrim(BACKUP_LIST, 0, MAX_BACKUPS - 1);
+    }
+
+    const nextRev = currentRev + 1;
+    await kv.set(KEY, data);
+    await kv.set(REV_KEY, nextRev);
+
+    return Response.json({ ok: true, rev: nextRev, savedAt: new Date().toISOString() });
   } catch (e) {
-    return Response.json({ ok: false, error: String(e) }, { status: 500 });
+    return fail(500, `Save failed: ${e?.message || e}`);
+  }
+}
+
+/** Restore a previous snapshot by its index in the backup list. */
+export async function PUT(request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return fail(400, "Invalid JSON body");
+  }
+
+  const { index } = body || {};
+  if (!Number.isInteger(index) || index < 0 || index >= MAX_BACKUPS) {
+    return fail(400, "index must be a valid backup position");
+  }
+
+  try {
+    const raw = await kv.lrange(BACKUP_LIST, index, index);
+    if (!raw || raw.length === 0) return fail(404, "No backup at that position");
+
+    const entry = typeof raw[0] === "string" ? JSON.parse(raw[0]) : raw[0];
+    const invalid = validate(entry?.data);
+    if (invalid) return fail(422, `Backup is unusable: ${invalid}`);
+
+    const currentRev = (await kv.get(REV_KEY)) ?? 0;
+    const current = await kv.get(KEY);
+
+    // Snapshot what we are about to replace, so a restore is itself undoable.
+    if (current) {
+      await kv.lpush(
+        BACKUP_LIST,
+        JSON.stringify({ at: new Date().toISOString(), rev: currentRev, data: current })
+      );
+      await kv.ltrim(BACKUP_LIST, 0, MAX_BACKUPS - 1);
+    }
+
+    const nextRev = currentRev + 1;
+    await kv.set(KEY, entry.data);
+    await kv.set(REV_KEY, nextRev);
+
+    return Response.json({ ok: true, rev: nextRev, data: entry.data });
+  } catch (e) {
+    return fail(500, `Restore failed: ${e?.message || e}`);
   }
 }
