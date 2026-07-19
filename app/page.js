@@ -1,6 +1,9 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+
+const LOCAL_KEY = 'fintrack:local-backup';
+const SHAPE = ['accounts','investments','goals','liabilities','snapshots'];
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, LineChart, Line, XAxis, YAxis } from "recharts";
 
 const INR = n => '₹' + Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0});
@@ -374,6 +377,75 @@ function More({liabilities,snapshots,openModal,setDel,addSnapshot,exportCSV,netW
   );
 }
 
+const SYNC_UI = {
+  loading : {dot:'#94a3b8', text:'Loading…',      color:'#64748b'},
+  saving  : {dot:'#f59e0b', text:'Saving…',       color:'#b45309'},
+  synced  : {dot:'#10b981', text:'Saved',         color:'#059669'},
+  empty   : {dot:'#8b5cf6', text:'Sample data',   color:'#7c3aed'},
+  error   : {dot:'#ef4444', text:'Not saving',    color:'#dc2626'},
+  conflict: {dot:'#ef4444', text:'Out of date',   color:'#dc2626'},
+};
+
+function SyncPill({sync,onRetry}){
+  const ui = SYNC_UI[sync] || SYNC_UI.loading;
+  const bad = sync==='error' || sync==='conflict';
+  return(
+    <button
+      onClick={bad?onRetry:undefined}
+      title={bad?'Click to retry':undefined}
+      style={{display:'flex',alignItems:'center',gap:6,background:bad?'#fef2f2':'transparent',
+              border:bad?'1px solid #fecaca':'1px solid transparent',borderRadius:50,
+              padding:'4px 10px',cursor:bad?'pointer':'default',fontSize:11,fontWeight:600,color:ui.color}}>
+      <span style={{width:7,height:7,borderRadius:'50%',background:ui.dot,flexShrink:0}}/>
+      {ui.text}
+    </button>
+  );
+}
+
+function DataSync({sync,syncMsg,lastSaved,isDemo,onReload,onExportJSON,onImportJSON,backups,onLoadBackups,onRestore}){
+  const ui = SYNC_UI[sync] || SYNC_UI.loading;
+  return(
+    <div style={G.card}>
+      <div style={{fontWeight:700,fontSize:16,marginBottom:4}}>🔄 Data & Sync</div>
+      <div style={{...G.row,gap:8,marginBottom:8}}>
+        <span style={{width:9,height:9,borderRadius:'50%',background:ui.dot}}/>
+        <span style={{fontWeight:600,fontSize:14,color:ui.color}}>{ui.text}</span>
+        {lastSaved&&sync==='synced'&&<span style={{fontSize:12,color:'#94a3b8'}}>· {lastSaved.toLocaleTimeString()}</span>}
+      </div>
+      {syncMsg&&<div style={{fontSize:12,color:sync==='error'||sync==='conflict'?'#dc2626':'#64748b',marginBottom:12,lineHeight:1.5}}>{syncMsg}</div>}
+      {isDemo&&<div style={{fontSize:12,background:'#f5f3ff',color:'#6d28d9',borderRadius:8,padding:10,marginBottom:12,lineHeight:1.5}}>
+        You are looking at sample figures. Nothing is stored yet — your first edit becomes your real data.
+      </div>}
+      <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+        <button onClick={onReload} style={{...G.btnSm,background:'#eef2ff',color:'#4f46e5'}}>Reload from server</button>
+        <button onClick={onExportJSON} style={{...G.btnSm,background:'#eef2ff',color:'#4f46e5'}}>Download backup</button>
+        <label style={{...G.btnSm,background:'#eef2ff',color:'#4f46e5',display:'inline-block'}}>
+          Restore from file
+          <input type="file" accept="application/json" onChange={onImportJSON} style={{display:'none'}}/>
+        </label>
+        <button onClick={onLoadBackups} style={{...G.btnSm,background:'#eef2ff',color:'#4f46e5'}}>Server backups</button>
+      </div>
+      {backups&&(
+        <div style={{marginTop:14,borderTop:'1px solid #f1f5f9',paddingTop:12}}>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:8}}>Recent server snapshots</div>
+          {backups.length===0&&<div style={{fontSize:12,color:'#94a3b8'}}>No snapshots stored yet.</div>}
+          {backups.map(b=>(
+            <div key={b.index} style={{...G.row,justifyContent:'space-between',padding:'7px 0',borderBottom:'1px solid #f8fafc'}}>
+              <div style={{minWidth:0}}>
+                <div style={{fontSize:12,fontWeight:600}}>{new Date(b.at).toLocaleString()}</div>
+                <div style={{fontSize:11,color:'#94a3b8'}}>
+                  {b.counts.accounts} accounts · {b.counts.investments} investments · {b.counts.goals} goals
+                </div>
+              </div>
+              <button onClick={()=>onRestore(b.index)} style={{...G.btnSm,padding:'6px 12px',background:'#f1f5f9',color:'#475569'}}>Restore</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Page(){
   const [tab,setTab]           = useState('dashboard');
   const [accounts,setAccounts] = useState(DEMO.accounts);
@@ -385,7 +457,21 @@ export default function Page(){
   const [form,setForm]         = useState({});
   const [delItem,setDel]       = useState(null);
   const [isWide,setWide]       = useState(true);
-  const [loaded,setLoaded]     = useState(false);
+
+  // sync: 'loading' | 'synced' | 'saving' | 'error' | 'conflict' | 'empty'
+  const [sync,setSync]         = useState('loading');
+  const [syncMsg,setSyncMsg]   = useState('');
+  const [lastSaved,setLast]    = useState(null);
+  const [isDemo,setIsDemo]     = useState(false);
+  const [backups,setBackups]   = useState(null);
+
+  // canSave stays false until a read genuinely succeeds. This is the single
+  // most important line in the file: without it, a failed load silently
+  // overwrites good data with whatever happens to be in state.
+  const canSave      = useRef(false);
+  const rev          = useRef(0);
+  const lastSynced   = useRef(null);   // JSON of the last known server state
+  const saveTimer    = useRef(null);
 
   useEffect(()=>{
     const update=()=>setWide(window.innerWidth>=768);
@@ -394,32 +480,124 @@ export default function Page(){
     return()=>window.removeEventListener('resize',update);
   },[]);
 
-  useEffect(()=>{
-    (async()=>{
-      try{
-        const res = await fetch('/api/data');
-        const d = await res.json();
-        if(d.accounts) setAccounts(d.accounts);
-        if(d.investments) setInv(d.investments);
-        if(d.goals) setGoals(d.goals);
-        if(d.liabilities) setLiab(d.liabilities);
-        if(d.snapshots) setSnaps(d.snapshots);
-      }catch{}finally{setLoaded(true);}
-    })();
+  const applyData = useCallback(d=>{
+    setAccounts(d.accounts||[]);
+    setInv(d.investments||[]);
+    setGoals(d.goals||[]);
+    setLiab(d.liabilities||[]);
+    setSnaps(d.snapshots||[]);
   },[]);
 
+  const snapshotOf = (a,i,g,l,s)=>JSON.stringify({accounts:a,investments:i,goals:g,liabilities:l,snapshots:s});
+
+  // ---- load ----------------------------------------------------------------
+  const load = useCallback(async()=>{
+    setSync('loading'); setSyncMsg('');
+    try{
+      const res = await fetch('/api/data',{cache:'no-store'});
+      const body = await res.json().catch(()=>null);
+
+      if(!res.ok || !body?.ok){
+        canSave.current = false;
+        setSync('error');
+        setSyncMsg(body?.error || `Could not reach storage (HTTP ${res.status})`);
+        // Show the local mirror so the screen isn't blank, but stay read-only.
+        try{
+          const cached = localStorage.getItem(LOCAL_KEY);
+          if(cached){ applyData(JSON.parse(cached)); setSyncMsg(m=>m+' — showing your last local copy (read-only)'); }
+        }catch{}
+        return;
+      }
+
+      rev.current = body.rev ?? 0;
+
+      if(body.data){
+        applyData(body.data);
+        lastSynced.current = snapshotOf(
+          body.data.accounts||[], body.data.investments||[],
+          body.data.goals||[], body.data.liabilities||[], body.data.snapshots||[]
+        );
+        canSave.current = true;
+        setIsDemo(false);
+        setSync('synced');
+      }else{
+        // Genuinely empty store. Seed the screen with demo values so there is
+        // something to look at, but mark it clearly and allow saving.
+        applyData(DEMO);
+        lastSynced.current = null;
+        canSave.current = true;
+        setIsDemo(true);
+        setSync('empty');
+        setSyncMsg('No saved data yet — these are sample figures. Edit anything to start your own.');
+      }
+    }catch(e){
+      canSave.current = false;
+      setSync('error');
+      setSyncMsg(String(e?.message||e));
+    }
+  },[applyData]);
+
+  useEffect(()=>{ load(); },[load]);
+
+  // ---- save ----------------------------------------------------------------
+  const save = useCallback(async(payload)=>{
+    setSync('saving');
+    try{
+      const res = await fetch('/api/data',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ data:payload, baseRev:rev.current }),
+      });
+      const body = await res.json().catch(()=>null);
+
+      if(res.status===409){
+        canSave.current = false;
+        setSync('conflict');
+        setSyncMsg('This data was changed somewhere else. Reload to get the newer copy.');
+        return;
+      }
+      if(!res.ok || !body?.ok){
+        setSync('error');
+        setSyncMsg(body?.error || `Save failed (HTTP ${res.status}) — kept locally`);
+        return;
+      }
+
+      rev.current = body.rev;
+      lastSynced.current = JSON.stringify(payload);
+      setIsDemo(false);
+      setLast(new Date());
+      setSync('synced');
+      setSyncMsg('');
+    }catch(e){
+      setSync('error');
+      setSyncMsg(`${e?.message||e} — kept locally, will retry on next change`);
+    }
+  },[]);
+
+  // Mirror locally on every change, then debounce the network write.
   useEffect(()=>{
-    if(!loaded) return;
-    (async()=>{
-      try{
-        await fetch('/api/data', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({accounts,investments,goals,liabilities,snapshots}),
-        });
-      }catch{}
-    })();
-  },[accounts,investments,goals,liabilities,snapshots,loaded]);
+    const payload = {accounts,investments,goals,liabilities,snapshots};
+    const current = JSON.stringify(payload);
+
+    try{ localStorage.setItem(LOCAL_KEY, current); }catch{}
+
+    if(!canSave.current) return;          // never write from a failed load
+    if(current === lastSynced.current) return;  // nothing actually changed
+
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(()=>save(payload), 700);
+    return()=>clearTimeout(saveTimer.current);
+  },[accounts,investments,goals,liabilities,snapshots,save]);
+
+  // Warn before closing with unsaved edits.
+  useEffect(()=>{
+    const handler = e=>{
+      const current = JSON.stringify({accounts,investments,goals,liabilities,snapshots});
+      if(canSave.current && current!==lastSynced.current){ e.preventDefault(); e.returnValue=''; }
+    };
+    window.addEventListener('beforeunload',handler);
+    return()=>window.removeEventListener('beforeunload',handler);
+  },[accounts,investments,goals,liabilities,snapshots]);
 
   const totalAccounts  = useMemo(()=>accounts.reduce((s,a)=>s+Number(a.balance),0),[accounts]);
   const totalInvested  = useMemo(()=>investments.reduce((s,i)=>s+Number(i.invested),0),[investments]);
@@ -494,6 +672,58 @@ export default function Page(){
     URL.revokeObjectURL(url);
   };
 
+  const exportJSON=()=>{
+    const payload={version:1,exportedAt:new Date().toISOString(),accounts,investments,goals,liabilities,snapshots};
+    const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`fintrack_backup_${new Date().toISOString().slice(0,10)}.json`;a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJSON=e=>{
+    const file=e.target.files?.[0];
+    if(!file) return;
+    const reader=new FileReader();
+    reader.onload=()=>{
+      try{
+        const d=JSON.parse(String(reader.result));
+        const missing=SHAPE.filter(k=>!Array.isArray(d[k]));
+        if(missing.length){ setSyncMsg(`That file is missing: ${missing.join(', ')}`); setSync('error'); return; }
+        applyData(d);
+        setSyncMsg('Restored from file — saving to server…');
+      }catch(err){ setSync('error'); setSyncMsg(`Could not read that file: ${err.message}`); }
+    };
+    reader.readAsText(file);
+    e.target.value='';
+  };
+
+  const loadBackups=async()=>{
+    try{
+      const res=await fetch('/api/data?backups',{cache:'no-store'});
+      const body=await res.json().catch(()=>null);
+      if(!res.ok||!body?.ok){ setSync('error'); setSyncMsg(body?.error||'Could not list backups'); return; }
+      setBackups(body.backups||[]);
+    }catch(err){ setSync('error'); setSyncMsg(String(err?.message||err)); }
+  };
+
+  const restoreBackup=async index=>{
+    if(!window.confirm('Replace your current data with this snapshot? The current version is saved as a new snapshot first, so this can be undone.')) return;
+    try{
+      const res=await fetch('/api/data',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({index})});
+      const body=await res.json().catch(()=>null);
+      if(!res.ok||!body?.ok){ setSync('error'); setSyncMsg(body?.error||'Restore failed'); return; }
+      rev.current=body.rev;
+      applyData(body.data);
+      lastSynced.current=JSON.stringify({
+        accounts:body.data.accounts||[],investments:body.data.investments||[],goals:body.data.goals||[],
+        liabilities:body.data.liabilities||[],snapshots:body.data.snapshots||[],
+      });
+      canSave.current=true;
+      setIsDemo(false); setSync('synced'); setSyncMsg('Restored from snapshot.');
+      setBackups(null);
+    }catch(err){ setSync('error'); setSyncMsg(String(err?.message||err)); }
+  };
+
   const NAV=[{id:'dashboard',icon:'📊',label:'Home'},{id:'accounts',icon:'🏦',label:'Accounts'},{id:'investments',icon:'📈',label:'Invest'},{id:'goals',icon:'🎯',label:'Goals'},{id:'more',icon:'☰',label:'More'}];
   const onSave=modal==='account'?saveAccount:modal==='investment'?saveInvestment:modal==='goal'?saveGoal:saveLiability;
 
@@ -515,6 +745,9 @@ export default function Page(){
           <div style={{padding:'14px 16px',borderTop:'1px solid #e2e8f0',textAlign:'center'}}>
             <div style={{fontSize:11,color:'#94a3b8'}}>Net Worth</div>
             <div style={{fontWeight:800,color:'#4f46e5',fontSize:17}}>{INR(netWorth)}</div>
+            <div style={{display:'flex',justifyContent:'center',marginTop:6}}>
+              <SyncPill sync={sync} onRetry={load}/>
+            </div>
           </div>
         </aside>
       )}
@@ -522,14 +755,24 @@ export default function Page(){
         {!isWide&&(
           <div style={{background:'#fff',borderBottom:'1px solid #e2e8f0',padding:'13px 16px',position:'sticky',top:0,zIndex:5,display:'flex',alignItems:'center',justifyContent:'space-between'}}>
             <div style={{fontWeight:800,fontSize:18,color:'#4f46e5'}}>💰 FinTrack</div>
-            <div style={{fontSize:12,color:'#64748b'}}>NW: <b style={{color:'#4f46e5'}}>{INR(netWorth)}</b></div>
+            <div style={{...G.row,gap:4}}>
+              <SyncPill sync={sync} onRetry={load}/>
+              <div style={{fontSize:12,color:'#64748b'}}>NW: <b style={{color:'#4f46e5'}}>{INR(netWorth)}</b></div>
+            </div>
           </div>
         )}
         {tab==='dashboard'   &&<Dashboard {...{netWorth,totalAccounts,totalPortfolio,totalLiab,totalGain,totalInvested,allocation,snapshots,goals}}/>}
         {tab==='accounts'    &&<Accounts {...{accounts,openModal,setDel}}/>}
         {tab==='investments' &&<Investments {...{investments,openModal,setDel,totalInvested,totalPortfolio,totalGain}}/>}
         {tab==='goals'       &&<Goals {...{goals,openModal,setDel}}/>}
-        {tab==='more'        &&<More {...{liabilities,snapshots,openModal,setDel,addSnapshot,exportCSV,netWorth,totalLiab}}/>}
+        {tab==='more'        &&<>
+          <div style={{padding:'16px 16px 0'}}>
+            <DataSync {...{sync,syncMsg,lastSaved,isDemo,backups}}
+              onReload={load} onExportJSON={exportJSON} onImportJSON={importJSON}
+              onLoadBackups={loadBackups} onRestore={restoreBackup}/>
+          </div>
+          <More {...{liabilities,snapshots,openModal,setDel,addSnapshot,exportCSV,netWorth,totalLiab}}/>
+        </>}
       </main>
       {!isWide&&(
         <nav style={{position:'fixed',bottom:0,left:0,right:0,background:'#fff',borderTop:'1px solid #e2e8f0',display:'flex',zIndex:10}}>
